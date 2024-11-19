@@ -205,7 +205,7 @@ class MaskTransformer(nn.Module):
         super().__init__()
         self.config = config
         # define the transformer argparse
-        self.mask_ratio = config.transformer_config.mask_ratio 
+        self.num_group_mask = config.transformer_config.num_group_mask
         self.trans_dim = config.transformer_config.trans_dim
         self.depth = config.transformer_config.depth 
         self.drop_path_rate = config.transformer_config.drop_path_rate
@@ -254,7 +254,7 @@ class MaskTransformer(nn.Module):
             mask : B G (bool)
         '''
         # skip the mask
-        if noaug or self.mask_ratio == 0:
+        if noaug or self.num_group_mask == 0:
             return torch.zeros(center.shape[:2]).bool()
         # mask a continuous part
         mask_idx = []
@@ -266,8 +266,7 @@ class MaskTransformer(nn.Module):
                                          dim=-1)  # 1 1 3 - 1 G 3 -> 1 G
 
             idx = torch.argsort(distance_matrix, dim=-1, descending=False)[0]  # G
-            ratio = self.mask_ratio
-            mask_num = int(ratio * len(idx))
+            mask_num = self.num_group_mask
             mask = torch.zeros(len(idx))
             mask[idx[:mask_num]] = 1
             mask_idx.append(mask.bool())
@@ -284,10 +283,10 @@ class MaskTransformer(nn.Module):
         '''
         B, G, _ = center.shape
         # skip the mask
-        if noaug or self.mask_ratio == 0:
+        if noaug or self.num_group_mask == 0:
             return torch.zeros(center.shape[:2]).bool()
 
-        self.num_mask = int(self.mask_ratio * G)
+        self.num_mask = self.num_group_mask
 
         overall_mask = np.zeros([B, G])
         for i in range(B):
@@ -301,8 +300,10 @@ class MaskTransformer(nn.Module):
 
         return overall_mask.to(center.device) # B G
 
-    def forward(self, neighborhood, center, noaug = False):
+    def forward(self, neighborhood, center, noaug = False, mask = None):
         # generate mask
+        if mask is not None:
+            bool_masked_pos = mask
         if self.mask_type == 'rand':
             bool_masked_pos = self._mask_center_rand(center, noaug = noaug) # B G
         else:
@@ -334,7 +335,6 @@ class Point_MAE(nn.Module):
         self.trans_dim = config.transformer_config.trans_dim
         self.MAE_encoder = MaskTransformer(config)
         self.group_size = config.group_size
-        self.num_group = config.num_group
         self.drop_path_rate = config.transformer_config.drop_path_rate
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.trans_dim))
         self.decoder_pos_embed = nn.Sequential(
@@ -353,8 +353,17 @@ class Point_MAE(nn.Module):
             num_heads=self.decoder_num_heads,
         )
 
-        print_log(f'[Point_MAE] divide point cloud into G{self.num_group} x S{self.group_size} points ...', logger ='Point_MAE')
-        self.group_divider = Group(num_group = self.num_group, group_size = self.group_size)
+        # print_log(f'[Point_MAE] divide point cloud into G{self.num_group} x S{self.group_size} points ...', logger ='Point_MAE')
+        # self.group_divider = Group(num_group = config.num_group, group_size = self.group_size)
+
+        num_group_total = config.num_group
+        num_group_masked = config.transformer_config.num_group_mask
+        num_group_visible = num_group_total - num_group_masked
+
+        print_log(f'[Point_MAE] divide point cloud into G{num_group_total} x S{self.group_size} points ...', logger ='Point_MAE')
+
+        self.group_divider_mask = Group(num_group = num_group_masked, group_size = self.group_size)
+        self.group_divider_visible = Group(num_group = num_group_visible, group_size = self.group_size)
 
         # prediction head
         self.increase_dim = nn.Sequential(
@@ -380,9 +389,47 @@ class Point_MAE(nn.Module):
 
 
     def forward(self, pts, vis = False, **kwargs):
-        neighborhood, center = self.group_divider(pts)
+        neighborhood_mask, center_mask = self.group_divider_mask(pts)
+        neighborhood_visible, center_visible = self.group_divider_visible(pts)
 
-        x_vis, mask = self.MAE_encoder(neighborhood, center)
+        batch_size = pts.size(0)
+
+        print(f"neighborhood_mask shape: {neighborhood_mask.shape}")
+        print(f"center_mask shape: {center_mask.shape}")
+
+        print(f"neighborhood_visible shape: {neighborhood_visible.shape}")
+        print(f"center_visible shape: {center_visible.shape}")
+
+        mask = torch.cat([
+            torch.zeros(batch_size, neighborhood_mask.size(1)),
+            torch.ones(batch_size, neighborhood_visible.size(1)),
+        ], dim=1).bool()
+
+        neighborhood = torch.cat([neighborhood_mask, neighborhood_visible], dim=1)
+        center = torch.cat([center_mask, center_visible], dim=1)
+
+        print("    ")
+        print(f"mask shape: {mask.shape}")
+        print(f"neighborhood shape: {neighborhood.shape}")
+        print(f"center shape: {center.shape}")
+        print(("       "))
+
+        permuted_indices = torch.randperm(center.shape[1])
+        print(f"permuted_indices shape: {permuted_indices.shape}")
+
+        neighborhood, center, mask = neighborhood[:,permuted_indices, :, :], center[:, permuted_indices, :], mask[:, permuted_indices]
+        print(f"neighborhood shape: {neighborhood.shape}")
+        print(f"center shape: {center.shape}")
+        print(f"mask shape: {mask.shape}")
+
+        x_vis, _ = self.MAE_encoder(neighborhood, center, mask=mask)
+
+        # neighborhood, center = self.group_divider(pts)
+        # print(f"neighborhood shape: {neighborhood.shape} center shape: {center.shape}")
+
+        # x_vis, mask = self.MAE_encoder(neighborhood, center)
+        # print(f"x_vis shape: {x_vis.shape} mask shape: {mask.shape}")
+
         B,_,C = x_vis.shape # B VIS C
 
         pos_emd_vis = self.decoder_pos_embed(center[~mask]).reshape(B, -1, C)
