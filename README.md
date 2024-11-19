@@ -34,6 +34,20 @@ pip install "git+https://github.com/erikwijmans/Pointnet2_PyTorch.git#egg=pointn
 pip install --upgrade https://github.com/unlimblue/KNN_CUDA/releases/download/0.2/KNN_CUDA-0.2-py3-none-any.whl
 ```
 
+## 1a. Requirements (extra, more specific)
+```
+mamba install python=3.7 numpy=1.20 numba
+mamba install -y pytorch=1.10.1 torchvision cudatoolkit=11.3 -c pytorch -c nvidia -c conda-forge
+mamba install pyyaml
+mamba install loguru
+mamba install conda-forge::pytorch-lightning
+mamba install setuptools=58.2.0
+mamba install nbformat
+mamba install mlflow
+mamba install conda-forge::databricks-cli
+mamba install boto3
+```
+
 ## 2. Datasets
 
 We use ShapeNet, ScanObjectNN, ModelNet40 and ShapeNetPart in this work. See [DATASET.md](./DATASET.md) for details.
