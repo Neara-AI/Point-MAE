@@ -48,12 +48,13 @@ class Encoder(nn.Module):   ## Embedding module
         return feature_global.reshape(bs, g, self.encoder_channel)
 
 
-class Group(nn.Module):  # FPS + KNN
-    def __init__(self, num_group, group_size):
+class Group(nn.Module):   # FPS + KNN
+    def __init__(self, num_group, group_size, return_other_points=False):
         super().__init__()
         self.num_group = num_group
         self.group_size = group_size
         self.knn = KNN(k=self.group_size, transpose_mode=True)
+        self.return_other_points = return_other_points
 
     def forward(self, xyz):
         '''
@@ -64,20 +65,106 @@ class Group(nn.Module):  # FPS + KNN
         '''
         batch_size, num_points, _ = xyz.shape
         # fps the centers out
-        center = misc.fps(xyz, self.num_group) # B G 3
+        if self.num_group == 1:
+            center_idx = np.random.randint(0, num_points)
+            center = xyz[:, center_idx, :].unsqueeze(1)  # B G 3
+            print(f"center.shape: {center.shape}")
+        else:
+            center = misc.fps(xyz, self.num_group) # B G 3
+
         # knn to get the neighborhood
         _, idx = self.knn(xyz, center) # B G M
         assert idx.size(1) == self.num_group
         assert idx.size(2) == self.group_size
+
         idx_base = torch.arange(0, batch_size, device=xyz.device).view(-1, 1, 1) * num_points
+
         idx = idx + idx_base
         idx = idx.view(-1)
+
+        is_in_group = torch.full((batch_size * num_points, ), 0).bool()
+        is_in_group[idx] = True
+
+        print(f"is_in_group shape: {is_in_group.shape}")
+        print(torch.sum(is_in_group))
+
         neighborhood = xyz.view(batch_size * num_points, -1)[idx, :]
         neighborhood = neighborhood.view(batch_size, self.num_group, self.group_size, 3).contiguous()
         # normalize
         neighborhood = neighborhood - center.unsqueeze(2)
+
+        if self.return_other_points:
+            remaining_points = xyz.view(batch_size * num_points, -1)[~is_in_group, :]
+            remaining_points = remaining_points.view(batch_size, -1, 3).contiguous()
+            return neighborhood, center, remaining_points
+        
         return neighborhood, center
 
+
+class GroupMask(nn.Module):   # FPS + KNN
+    def __init__(self, group_size, ball_radius):
+        super().__init__()
+        self.group_size = group_size
+        self.ball_radius = ball_radius
+        self.knn = KNN(k=self.group_size, transpose_mode=True)
+
+    def forward(self, xyz):
+        '''
+        '''
+        batch_size, num_points, _ = xyz.shape
+
+        # Randomly sample a single point as the masked ball center
+        center_idx = np.random.randint(0, num_points)
+        center = xyz[:, center_idx, :].view(batch_size, 1, -1).contiguous()  # B, 1, 3
+
+        # Get the indices of all the points within a radius of the ball center
+        idx_ball = misc.ball_query(
+            self.ball_radius,
+            num_points,
+            xyz,
+            center
+        ).long()
+
+        # Flatten and remap the indices to a 1D tensor
+        idx_base = torch.arange(0, batch_size, device=xyz.device).view(-1, 1, 1) * num_points
+        idx_ball_flat = (idx_ball + idx_base).view(-1)
+
+        # Slice the flattened point tensor to get the points within each ball and reshape it back to the original shape
+        xyz_flat = xyz.view(batch_size * num_points, -1)
+        ball_points = xyz_flat[idx_ball_flat, :]
+        ball_points = ball_points.view(batch_size, -1, 3).contiguous() # B, num_points, 3
+
+        assert ball_points.size(1) == num_points
+
+        # FPS within the ball to get a constant number of points for the reconstruction target
+        idx_ball_fps = misc.furthest_point_sample(ball_points, self.group_size).long()
+        idx_ball_fps = idx_ball_fps + torch.arange(0, batch_size, device=xyz.device).view(-1, 1) * num_points
+        # Remap the indices in the ball query tensor to indices in the original point tensor
+        idx = idx_ball_flat[idx_ball_fps.view(-1)] # B, group_size
+
+        # Turn the indices of the ball query into a boolean mask
+        is_in_ball = torch.full((batch_size * num_points, ), 0).bool()
+        is_in_ball[idx_ball_flat] = True
+        is_in_ball = is_in_ball.view((xyz.size(0), xyz.size(1))) # B, N
+
+        # Get a tensor containing the masked neighbourhood sampled from the ball
+        masked_patch = xyz_flat[idx, :]
+        masked_patch = masked_patch.view(batch_size, 1, self.group_size, 3).contiguous()
+        # Recenter each masked patch around the center point
+        # TODO: normalize
+        masked_patch = masked_patch - center.unsqueeze(2)
+
+        # Use FPS to sample the remaining points from the points outside the ball to a constant size.
+        # We return a tensor containing all the non-masked points to be used as context.
+        num_points_remaining = xyz.size(1) - self.group_size
+        remaining = []
+        for b in range(batch_size):
+            r = xyz[b][~is_in_ball[b]]
+            idx = misc.furthest_point_sample(r.unsqueeze(0), num_points_remaining)
+            remaining.append(r[idx[0].long()])
+        remaining_points = torch.stack(remaining, dim=0)
+        return masked_patch, center, remaining_points
+    
 
 ## Transformers
 class Mlp(nn.Module):
@@ -192,7 +279,7 @@ class TransformerDecoder(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x, pos, return_token_num):
-        for _, block in enumerate(self.blocks):
+        for i, block in enumerate(self.blocks):
             x = block(x + pos)
 
         x = self.head(self.norm(x[:, -return_token_num:]))  # only return the mask tokens predict pixel
@@ -303,27 +390,27 @@ class MaskTransformer(nn.Module):
     def forward(self, neighborhood, center, noaug = False, mask = None):
         # generate mask
         if mask is not None:
-            bool_masked_pos = mask
+            hidden_mask = mask
         if self.mask_type == 'rand':
-            bool_masked_pos = self._mask_center_rand(center, noaug = noaug) # B G
+            hidden_mask = self._mask_center_rand(center, noaug = noaug) # B G
         else:
-            bool_masked_pos = self._mask_center_block(center, noaug = noaug)
+            hidden_mask = self._mask_center_block(center, noaug = noaug)
 
         group_input_tokens = self.encoder(neighborhood)  #  B G C
 
         batch_size, seq_len, C = group_input_tokens.size()
 
-        x_vis = group_input_tokens[~bool_masked_pos].reshape(batch_size, -1, C)
+        x_vis = group_input_tokens[~hidden_mask].reshape(batch_size, -1, C)
         # add pos embedding
         # mask pos center
-        masked_center = center[~bool_masked_pos].reshape(batch_size, -1, 3)
+        masked_center = center[hidden_mask].reshape(batch_size, -1, 3)
         pos = self.pos_embed(masked_center)
 
         # transformer
         x_vis = self.blocks(x_vis, pos)
         x_vis = self.norm(x_vis)
 
-        return x_vis, bool_masked_pos
+        return x_vis, hidden_mask
 
 
 @MODELS.register_module()
@@ -362,7 +449,8 @@ class Point_MAE(nn.Module):
 
         print_log(f'[Point_MAE] divide point cloud into G{num_group_total} x S{self.group_size} points ...', logger ='Point_MAE')
 
-        self.group_divider_mask = Group(num_group = num_group_masked, group_size = self.group_size)
+        self.group_divider_masked = GroupMask(group_size = self.group_size, ball_radius=config.mask_ball_radius)
+        # self.group_divider_masked = Group(num_group = num_group_masked, group_size = self.group_size, return_other_points=True)
         self.group_divider_visible = Group(num_group = num_group_visible, group_size = self.group_size)
 
         # prediction head
@@ -389,64 +477,37 @@ class Point_MAE(nn.Module):
 
 
     def forward(self, pts, vis = False, **kwargs):
-        neighborhood_mask, center_mask = self.group_divider_mask(pts)
-        neighborhood_visible, center_visible = self.group_divider_visible(pts)
+        neighborhood_masked, center_masked, remaining_pts = self.group_divider_masked(pts)
+        neighborhood_visible, center_visible = self.group_divider_visible(remaining_pts)
 
         batch_size = pts.size(0)
-
-        print(f"neighborhood_mask shape: {neighborhood_mask.shape}")
-        print(f"center_mask shape: {center_mask.shape}")
-
-        print(f"neighborhood_visible shape: {neighborhood_visible.shape}")
-        print(f"center_visible shape: {center_visible.shape}")
-
-        mask = torch.cat([
-            torch.zeros(batch_size, neighborhood_mask.size(1)),
-            torch.ones(batch_size, neighborhood_visible.size(1)),
+        hidden_mask = torch.cat([
+            torch.ones(batch_size, neighborhood_masked.size(1)),
+            torch.zeros(batch_size, neighborhood_visible.size(1)),
         ], dim=1).bool()
-
-        neighborhood = torch.cat([neighborhood_mask, neighborhood_visible], dim=1)
-        center = torch.cat([center_mask, center_visible], dim=1)
-
-        print("    ")
-        print(f"mask shape: {mask.shape}")
-        print(f"neighborhood shape: {neighborhood.shape}")
-        print(f"center shape: {center.shape}")
-        print(("       "))
+        neighborhood = torch.cat([neighborhood_masked, neighborhood_visible], dim=1)
+        center = torch.cat([center_masked, center_visible], dim=1)
 
         permuted_indices = torch.randperm(center.shape[1])
-        print(f"permuted_indices shape: {permuted_indices.shape}")
+        neighborhood, center, hidden_mask = neighborhood[:,permuted_indices, :, :], center[:, permuted_indices, :], hidden_mask[:, permuted_indices]
 
-        neighborhood, center, mask = neighborhood[:,permuted_indices, :, :], center[:, permuted_indices, :], mask[:, permuted_indices]
-        print(f"neighborhood shape: {neighborhood.shape}")
-        print(f"center shape: {center.shape}")
-        print(f"mask shape: {mask.shape}")
-
-        x_vis, _ = self.MAE_encoder(neighborhood, center, mask=mask)
-
-        # neighborhood, center = self.group_divider(pts)
-        # print(f"neighborhood shape: {neighborhood.shape} center shape: {center.shape}")
-
-        # x_vis, mask = self.MAE_encoder(neighborhood, center)
-        # print(f"x_vis shape: {x_vis.shape} mask shape: {mask.shape}")
-
+        x_vis, _ = self.MAE_encoder(neighborhood, center, mask=hidden_mask)
         B,_,C = x_vis.shape # B VIS C
 
-        pos_emd_vis = self.decoder_pos_embed(center[~mask]).reshape(B, -1, C)
-
-        pos_emd_mask = self.decoder_pos_embed(center[mask]).reshape(B, -1, C)
+        pos_emd_vis = self.decoder_pos_embed(center[~hidden_mask]).reshape(B, -1, C)
+        pos_emd_mask = self.decoder_pos_embed(center[hidden_mask]).reshape(B, -1, C)
 
         _,N,_ = pos_emd_mask.shape
         mask_token = self.mask_token.expand(B, N, -1)
+
         x_full = torch.cat([x_vis, mask_token], dim=1)
         pos_full = torch.cat([pos_emd_vis, pos_emd_mask], dim=1)
-
         x_rec = self.MAE_decoder(x_full, pos_full, N)
 
         B, M, C = x_rec.shape
 
         rebuild_points = self.increase_dim(x_rec.transpose(1, 2)).transpose(1, 2)  # B M 1024
-        gt_points = neighborhood[mask]
+        gt_points = neighborhood[hidden_mask]
 
         rebuild_points = rebuild_points.reshape(B, M, -1, 3)
         gt_points = gt_points.reshape(B, M, -1, 3)
@@ -454,26 +515,12 @@ class Point_MAE(nn.Module):
         loss = self.loss_func(rebuild_points.reshape(B*M,-1,3), gt_points.reshape(B*M,-1,3))
 
         shifted_neighborhood = neighborhood + center.unsqueeze(2)
-        visible_points = shifted_neighborhood[~mask].reshape(B, -1, neighborhood.shape[2], 3)
-        masked_points = shifted_neighborhood[mask].reshape(B, -1, neighborhood.shape[2], 3)
-        masked_centers = center[mask].reshape(center.shape[0], -1, 3)
+        visible_points = shifted_neighborhood[~hidden_mask].reshape(B, -1, neighborhood.shape[2], 3)
+        masked_points = shifted_neighborhood[hidden_mask].reshape(B, -1, neighborhood.shape[2], 3)
+        masked_centers = center[hidden_mask].reshape(center.shape[0], -1, 3)
         reconstructed_points = rebuild_points + masked_centers.unsqueeze(2)
 
         return loss, visible_points, masked_points, reconstructed_points
-        # if vis: #visualization
-        #     vis_points = neighborhood[~mask].reshape(B * (self.num_group - M), -1, 3)
-        #     full_vis = vis_points + center[~mask].unsqueeze(1)
-        #     full_rebuild = rebuild_points + center[mask].unsqueeze(1)
-        #     full = torch.cat([full_vis, full_rebuild], dim=0)
-        #     # full_points = torch.cat([rebuild_points,vis_points], dim=0)
-        #     full_center = torch.cat([center[mask], center[~mask]], dim=0)
-        #     # full = full_points + full_center.unsqueeze(1)
-        #     ret2 = full_vis.reshape(-1, 3).unsqueeze(0)
-        #     ret1 = full.reshape(-1, 3).unsqueeze(0)
-        #     # return ret1, ret2
-        #     return ret1, ret2, full_center
-        # else:
-        #     return loss, gt_points, rebuild_points
 
 
 class PositionalEmbedding(nn.Module):
@@ -656,7 +703,6 @@ class PointTransformer(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, pts):
-
         neighborhood, center = self.group_divider(pts)
         group_input_tokens = self.encoder(neighborhood)  # B G N
         cls_tokens = self.cls_token.expand(group_input_tokens.size(0), -1, -1)

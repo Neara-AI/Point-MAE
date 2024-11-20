@@ -38,6 +38,7 @@ pip install --upgrade https://github.com/unlimblue/KNN_CUDA/releases/download/0.
 ```
 mamba install python=3.7 numpy=1.20 numba
 mamba install -y pytorch=1.10.1 torchvision cudatoolkit=11.3 -c pytorch -c nvidia -c conda-forge
+mamba install mkl=2024.0.0
 mamba install pyyaml
 mamba install loguru
 mamba install conda-forge::pytorch-lightning

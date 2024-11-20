@@ -19,6 +19,9 @@ def fps(data, number):
     fps_data = pointnet2_utils.gather_operation(data.transpose(1, 2).contiguous(), fps_idx).transpose(1,2).contiguous()
     return fps_data
 
+ball_query = pointnet2_utils.ball_query
+
+furthest_point_sample = pointnet2_utils.furthest_point_sample
 
 def worker_init_fn(worker_id):
     np.random.seed(np.random.get_state()[1][0] + worker_id)
